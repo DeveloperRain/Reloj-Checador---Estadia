@@ -48,7 +48,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="TIMECORE API",
+    title="Sisterma de Gestión Centralizada de Asistencias : TIMECORE API",
     description="API para gestión de usuarios y asistencia del reloj biométrico ZKTeco/Steren",
     version="1.0.0",
     lifespan=lifespan,
@@ -123,7 +123,7 @@ def custom_openapi():
         return app.openapi_schema
 
     openapi_schema = get_openapi(
-        title="TIMECORE API",
+        title="Sisterma de Gestión Centralizada de Asistencias : TIMECORE API",
         version="1.0.0",
         description="API para gestión de usuarios, asistencia y dispositivo ZKTeco y/o Steren",
         routes=app.routes,

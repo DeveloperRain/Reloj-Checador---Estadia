@@ -4,6 +4,7 @@ from app.services.db_service import DBService
 from app.exceptions import (
     DeviceClockDriftError,
     DeviceDisconnectedDuringSyncError,
+    DeviceTimeoutError,
     SyncError,
     TimeCoreError,
 )
@@ -335,6 +336,32 @@ def sync_device_by_id(device_id: int, fail_fast: bool = False):
             DBService.update_device_status(
                 device_id=device_id,
                 estado="Desconectado",
+            )
+        except Exception:
+            pass
+        raise
+
+    except DeviceTimeoutError as e:
+        # El reloj alcanzÃ³ a autenticar y responder; la descarga del
+        # historial agotÃ³ su espera. Se conserva el estado Conectado para no
+        # confundir un timeout de datos con una pÃ©rdida de red.
+        try:
+            current_device = DBService.get_device_by_id(device_id)
+            if current_device:
+                ZKService.mark_device_connected(
+                    current_device.ip,
+                    current_device.port,
+                )
+            DBService.update_device_status(
+                device_id=device_id,
+                estado="Conectado",
+            )
+            DBService.create_log(
+                accion="Descarga de asistencias agotÃ³ el tiempo de espera",
+                detalle=(
+                    f"El reloj ID {device_id} sigue conectado, pero no terminÃ³ "
+                    f"de entregar el historial. Detalles: {e.details}"
+                ),
             )
         except Exception:
             pass

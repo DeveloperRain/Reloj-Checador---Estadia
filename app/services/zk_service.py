@@ -10,6 +10,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 from zk import ZK
 
+from app.services.zk_official_sdk import OfficialSdkError, get_attendance as get_sdk_attendance
+
 from app.config.logger import get_logger, log_exception
 from app.exceptions import (
     DeviceAuthenticationError,
@@ -512,19 +514,13 @@ class ZKService:
         :rtype: _SyncMonitorState
         """
         key = ZKService._device_key(ip, port)
-        ping_available = ZKService._ping_device(ip)
-        tcp_probe_available = (
-            False
-            if ping_available
-            else ZKService._tcp_probe(ip, int(port or PORT))
-        )
-        probe_mode = (
-            "ping"
-            if ping_available
-            else "tcp"
-            if tcp_probe_available
-            else "keepalive"
-        )
+        # Durante una sincronizaciÃ³n, ping tampoco es una prueba fiable: hay
+        # relojes que aceptan PyZK por TCP pero filtran o limitan ICMP. Abrir
+        # sondeos TCP paralelos tambiÃ©n puede cortar la Ãºnica sesiÃ³n que
+        # permite el dispositivo. La Ãºnica fuente de verdad es, por tanto,
+        # el socket PyZK activo, protegido por keepalive; una lectura fallida
+        # se traduce en DeviceDisconnectedDuringSyncError.
+        probe_mode = "keepalive"
         state = _SyncMonitorState(
             key=key,
             ip=ip,
@@ -888,9 +884,17 @@ class ZKService:
         :return: No devuelve ningún valor.
         :rtype: None
         """
+        if conn is None or not bool(getattr(conn, "is_connect", False)):
+            return
+
         try:
             conn.disconnect()
         except Exception as e:
+            # El watchdog puede cerrar el socket para desbloquear una lectura
+            # en curso. En ese caso PyZK reporta que la instancia ya no estÃ¡
+            # conectada; es un cierre idempotente, no un error adicional.
+            if not bool(getattr(conn, "is_connect", False)) or "not connected" in str(e).lower():
+                return
             logger.warning("No se pudo cerrar la conexion con el reloj: %s", e)
 
     @staticmethod
@@ -1255,9 +1259,32 @@ class ZKService:
                 # Esta operación solo lee información. No se deshabilita el
                 # dispositivo porque, si se pierde la red, podría quedar
                 # bloqueado sin poder ejecutar enable_device().
-                attendance_objects = conn.get_attendance() or []
+                try:
+                    attendance_objects = conn.get_attendance() or []
+                except (socket.timeout, TimeoutError) as pyzk_timeout:
+                    # Algunos firmwares antiguos responden a ZKTime.Net pero
+                    # no al comando de búfer de PyZK. El SDK oficial usa
+                    # ReadAllGLogData/SSR_GetGeneralLogData y funciona sobre
+                    # la misma conexión VPN.
+                    logger.warning(
+                        "PyZK agotó la lectura de asistencias en %s:%s; se usa el SDK oficial: %s",
+                        target_ip, target_port, pyzk_timeout,
+                    )
+                    ZKService._stop_sync_monitor(monitor_state)
+                    monitor_state = None
+                    ZKService._disconnect(conn)
+                    conn = None
+                    try:
+                        attendance_objects = get_sdk_attendance(target_ip, target_port)
+                    except OfficialSdkError as sdk_error:
+                        raise DeviceTimeoutError(
+                            message="El reloj no terminó de entregar el historial de asistencias",
+                            details={"ip": target_ip, "port": target_port, "stage": "attendance_read", "pyzk_error": str(pyzk_timeout), "sdk_error": str(sdk_error)},
+                        ) from sdk_error
                 ZKService._raise_if_sync_cancelled(monitor_state, "attendance_read")
 
+                if conn is None:
+                    conn = ZKService._create_connection(ip, port, password)
                 user_objects = conn.get_users() or []
                 ZKService._raise_if_sync_cancelled(monitor_state, "users_read")
 
@@ -1338,6 +1365,23 @@ class ZKService:
 
             except DeviceDisconnectedDuringSyncError:
                 raise
+            except (socket.timeout, TimeoutError) as e:
+                # La sesiÃ³n puede seguir autenticada y responder otros
+                # comandos (hora, usuarios) aunque el firmware no entregue
+                # el bloque de asistencias. No se debe registrar como una
+                # desconexiÃ³n ni cerrar forzadamente la sesiÃ³n.
+                raise DeviceTimeoutError(
+                    message=(
+                        "El reloj no terminÃ³ de entregar el historial de "
+                        "asistencias antes del tiempo de espera"
+                    ),
+                    details={
+                        "ip": target_ip,
+                        "port": target_port,
+                        "stage": "attendance_read",
+                        "original_error": str(e),
+                    },
+                ) from e
             except Exception as e:
                 error_text = str(e).lower()
                 looks_like_network_loss = isinstance(
